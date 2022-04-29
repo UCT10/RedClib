@@ -1,7 +1,16 @@
 #!/usr/bin/env nextflow
 
-// Run test project with:
-// nextflow redc.nf -params-file project.yml
+// TODOs:
+// 1. Check the specifications for all the modules. Restructure irrelevant as simple scripts.
+// 2. Process low/high check.
+// 3. Add checks for the read length.
+// 4. Verify intermediate file names
+// 5. Do not store the intermediary files
+// 6. Add backend choice hdf5/parquet/tsv/csv
+
+nextflow.enable.dsl = 2
+
+// Define help message
 
 def helpMessage() {
     log.info"""
@@ -9,1460 +18,643 @@ def helpMessage() {
 
     Usage:
     The typical command for launching the pipeline:
-      nextflow redc.nf -params-file project.yml
+      nextflow run main.nf -profile test,conda,debug -params-file params-redc.yml
 
-    All the parameters should be listed in the project file.
-    The explanation is provided with the default example.
+    All the parameters should be listed in the profile file.
     """.stripIndent()
 }
 
 // Show help message
-if (params.get('help', 'false').toBoolean()) {
+if (params.getOrDefault('help', 'false').toBoolean()) {
     helpMessage()
     exit 0
 }
 
-/* Useful Groovy methods */
-// Get the full path of the output directory
-String getOutputDir(output_type) {
-    new File(params.output.dirs.get(output_type, output_type)).getCanonicalPath()
+// Check required parameters
+if (params.input) { InputSamplesheet = params.input }
+    else { exit 1, 'Input samplesheet not specified!' }
+
+Genome = params.getOrDefault('genome', [:])
+if (params.genome.assembly) { Assembly = params.genome.assembly }
+    else { exit 1, 'Genome assembly is not specified!' }
+if (params.genome.genes_gtf) { GenesGtf = params.genome.genes_gtf }
+    else { exit 1, 'Genome RNA annotation GTF is not specified!' }
+
+// Check optional parameters
+def protocol = params.getOrDefault('protocol', [:])
+def chunksize = protocol.getOrDefault('chunksize', 100000000000)
+def check_restriction = protocol.getOrDefault('check_restriction', false)
+def RenzymesPreloaded = Genome.getOrDefault('restricted', [:])
+def runFastuniq = protocol.getOrDefault('run_fastuniq', false)
+
+// Check number of oligos, short oligos and fragments:
+nOligos = params.getOrDefault('oligos', [:]).keySet().size()
+nShortOligos = params.getOrDefault('short_oligos', [:]).keySet().size()
+nFragments = params.getOrDefault('fragments', [:]).keySet().size()
+
+// Include modules and subworkflows
+include { INPUT_CHECK_DOWNLOAD } from './subworkflows/local/input_check' addParams( options: [:] )
+include { INPUT_SPLIT          } from './subworkflows/local/input_split' addParams( options: [chunksize: chunksize] )
+
+include { GENOME_PREPARE } from './modules/local/genome_prepare/main'  addParams( options: [
+                             args: [
+                                genome: [chromsizes: Genome.getOrDefault("chromsizes", ""),
+                                index_prefix: Genome.getOrDefault("index_prefix", ""),
+                                fasta: Genome.getOrDefault("fasta", "")],
+                                auto_download_genome: Genome.getOrDefault("auto_download_genome", true)
+                            ] ] )
+include { RNADNATOOLS_GENOME_RECSITES as GENOME_RESTRICT } from './modules/rnadnatools/genome_recsites/main' addParams( options: [:])
+include { GENOME_PREPARE_RNA_ANNOTATIONS } from './modules/local/genome_prepare_rna_annotations/main' addParams( options: [
+                             args: [
+                                genes_gtf: GenesGtf,
+                                rna_annotation_suffix: Genome.getOrDefault('rna_annotation_suffix', '')
+                            ]])
+
+include { FASTQC } from './modules/nf-core/software/fastqc/main' addParams( options: [:] )
+include { FASTQ2TSV as TABLE_FASTQ2TSV } from './modules/local/fastq2table/main' addParams( options: [:] )
+
+if (runFastuniq){
+    include { DEDUP_FASTUNIQ as TABLE_DEDUP } from './subworkflows/local/dedup_fastuniq' addParams( options: [:] )
+    include { RNADNATOOLS_TABLE_ALIGN as TABLE_DEDUP_ALIGN } from './modules/rnadnatools/table_align/main'  addParams( options: [
+                                                            args: [
+                                                             input_format: 'tsv',
+                                                             ref_format: 'parquet',
+                                                             output_format: 'parquet',
+                                                             chunksize: 10000000,
+                                                             chunksize_writer: 100000,
+                                                             params: '--no-input-header --key-column 0 --ref-colname readID \
+                                                             --fill-values ".",0 --drop-key --new-colnames readID,isUnique'
+                                                            ], suffix:'.fastuniq'] )
 }
-// Return True if the file is URL
-Boolean isURL(line) {
-    return (line.startsWith("http://") || line.startsWith("https://") || line.startsWith("ftp://"))
-}
-// Return True if the file is gzipped
-Boolean isGZ(line) {
-    return (line.endsWith(".gz"))
-}
-// Return True if the file is sra
-Boolean isSRA(line) {
-    return (line.startsWith("sra:"))
-}
-// Parse forward (left) and reverse (right) pieces of the file,
-// assert that they correspond each other and return index
-String parseChunkPair(left_file, right_file) {
-    chunk_left_idx  =  left_file.toString().tokenize('.')[-3]
-    chunk_right_idx = right_file.toString().tokenize('.')[-3]
-    chunk_left_side  =  left_file.toString().tokenize('.')[-2]
-    chunk_right_side = right_file.toString().tokenize('.')[-2]
-    assert chunk_left_idx == chunk_right_idx
-    assert chunk_left_side != chunk_right_side
-    return chunk_left_idx
-}
+include { TRIMTABLE_CREATE as TABLE_TRIM } from './subworkflows/local/trimtable_create' addParams( options: [:] )
 
-/* Parameters for the run */
 
-def check_restriction = params.run.get('check_restriction', 'false').toBoolean()
-def dna_extension = params.run.get('dna_extension', '')
-def auto_download_genome = params.genome.get('auto_download_genome', 'true').toBoolean()
-def available_renz = []
 
-/////////////////////////////////////
-/*   PREPARE FOLDER WITH BINARIES  */
-/////////////////////////////////////
+include { OLIGOS_MAP } from './subworkflows/local/oligos_map' addParams( options: [:] )
 
-def align_universal = new File("bin/align_universal")
-def align_pairwise  = new File("bin/align_pairwise")
-def fasta2bin = new File("bin/fasta2bin")
-def fastq2bin = new File("bin/fastq2bin")
-def trimmomatic = new File("bin/Trimmomatic-0.39/trimmomatic-0.39.jar")
-def missing_executables = ((!align_universal.exists()) || (!align_pairwise.exists()) ||
-    (!fasta2bin.exists()) || (!fastq2bin.exists()) || (!trimmomatic.exists()))
+include { TSV_MERGE as TABLE_MERGE } from './modules/local/tsv_merge/main' addParams( options: [
+                                                             args: [:],
+                                                             suffix: '.table'] )
 
-def preprocessingCmd = ""
-if (missing_executables) {
-    preprocessingCmd = "bash ./bin/prepare_binaries.sh"
-}
+include { RNADNATOOLS_TABLE_CONVERT as TABLE_CONVERT } from './modules/rnadnatools/table_convert/main' addParams( options: [
+                                                             args: [
+                                                             input_format: 'tsv',
+                                                             output_format: 'parquet'
+                                                             ]])
 
-Channel.from(
-    preprocessingCmd.execute().text
-).into{PREPROCESSING_TO_RNA; PREPROCESSING}
+include { RNADNATOOLS_TABLE_EVALUATE as TABLE_EVALUATE_FRAGMENTS } from './modules/rnadnatools/table_evaluate/main'  addParams( options: [
+                                                             args: [
+                                                             format:'int',
+                                                             input_format: 'parquet',
+                                                             output_format: 'parquet'
+                                                             ], suffix:'.fragment-columns'] )
 
-///////////////////////////
-/* Running the processes */
-///////////////////////////
+include { RNADNATOOLS_SEGMENT_EXTRACT_FASTQ as FRAGMENTS_TO_FASTQ } from './modules/rnadnatools/segment_extract_fastq/main'  addParams( options: [
+                                                             args: [
+                                                             input_format: 'parquet'
+                                                             ], suffix:'.fragments'] )
 
-////////////////////////////
-/*   PREPARE THE GENOME   */
-////////////////////////////
+include { FASTQ_EXTEND } from './modules/local/fastq_extend/main' addParams( options: [
+                                                             args: [
+                                                             gzip: true
+                                                             ], suffix:'.ext'] )
 
-GENOME_ASSEMBLY = params.genome.get('assembly_name', 'genome')
-process DOWNLOAD_GENOME{
-    tag "${assembly}"
-    storeDir getOutputDir('genome')
+include { HISAT2_ALIGN } from './modules/local/hisat2/main' addParams( options: [args: [:]] )
+include { BAM2BED } from './modules/local/bam2bed/main' addParams( options: [args: [extraTags: ['NH', 'XM'], samFilter: '']])
 
-    input:
-    val assembly from GENOME_ASSEMBLY
+include { RNADNATOOLS_SEGMENT_GETCLOSEST as TABLE_ANNOTATE_RESTRICTION } from './modules/rnadnatools/segment_getclosest/main'  addParams( options: [args: [
+                                                             input_format: 'parquet',
+                                                             reference_format: 'tsv',
+                                                             output_format: 'parquet',
+                                                             params: '--key-columns chrom,start,end --ref-columns 0,1,5 --no-ref-header',
+                                                             chunksize: 1000000
+                                                             ]] )
 
-    output:
-    file "${assembly}.fa" into GENOME_FASTA
-    set file("${assembly}.chromsizes.txt"), assembly into GENOME_CHROMSIZES
-    //file "${assembly}.fa.*" into GENOME_INDEX
-    set "${assembly}.fa", file("${assembly}.fa.*") into GENOME_INDEX
+include { RNADNATOOLS_TABLE_EVALUATE as TABLE_EVALUATE_FILTERS } from './modules/rnadnatools/table_evaluate/main'  addParams( options: [
+                                                             args: [
+                                                             format:'bool',
+                                                             input_format: 'parquet',
+                                                             output_format: 'parquet'
+                                                             ], suffix:'.filters'] )
 
-    script:
-    if (auto_download_genome) {
-        """
-        wget http://hgdownload.cse.ucsc.edu/goldenPath/${assembly}/bigZips/${assembly}.fa.gz -O ${assembly}.fa.gz
-        bgzip -d -@ ${task.cpus} ${assembly}.fa.gz
-        faidx ${assembly}.fa -i chromsizes > ${assembly}.chromsizes.txt
-        hisat2-build -p ${task.cpus} ${assembly}.fa ${assembly}.fa
-        """
+include { RNADNATOOLS_TABLE_ALIGN as TABLE_BED } from './modules/rnadnatools/table_align/main'  addParams( options: [
+                                                            args: [
+                                                             input_format: 'tsv',
+                                                             ref_format: 'parquet',
+                                                             output_format: 'parquet',
+                                                             chunksize: 10000000,
+                                                             chunksize_writer: 100000,
+                                                             params: '--no-input-header --fill-values .,-1,-1,.,0,.,.,-1,-1 \
+                                                             --new-colnames chrom,start,end,readID,mapq,strand,cigar,nMultiMap,nSub \
+                                                             --key-column 3 --ref-colname readID'
+                                                            ]] )
+
+include { RNADNATOOLS_TABLE_MERGE as TABLE_FRAGMENTS_MERGE } from './modules/rnadnatools/table_merge/main' addParams( options: [
+                                                             args: [
+                                                             input_format: 'parquet',
+                                                             output_format: 'parquet'
+                                                             ], suffix:'.fragments'] )
+
+include { RNADNATOOLS_TABLE_MERGE as TABLE_RESTRICTION_MERGE } from './modules/rnadnatools/table_merge/main' addParams( options: [
+                                                             args: [
+                                                             input_format: 'parquet',
+                                                             output_format: 'parquet'
+                                                             ], suffix:'.restriction'] )
+
+include { RNADNATOOLS_TABLE_DUMP as TABLE_DUMP } from './modules/rnadnatools/table_dump/main' addParams( options: [
+                                                             args: [
+                                                             input_format: 'parquet',
+                                                             output_format: 'parquet'
+                                                             ]])
+
+include { RNADNATOOLS_TABLE_STACK as RESULTS_STACK } from './modules/rnadnatools/table_stack/main' addParams( options: [
+                                                             args: [
+                                                             input_format: 'parquet',
+                                                             output_format: 'tsv'
+                                                             ]])
+
+include { RNADNATOOLS_TABLE_STATS as RESULTS_STATS } from './modules/rnadnatools/table_stats/main' addParams( options: [
+                                                             args: [
+                                                             input_format: 'tsv'
+                                                             ]])
+
+// Extra keys of the metadata that might be dynamically added in the pipeline:
+def extraKeys = ['fragment', 'side', 'selection_criteria', 'single_end', 'mapping_args', 'restriction', 'extended', 'ext_suffix', 'ext_prefix']
+def oligoKeys = ['oligo', 'side', 'idx']
+def dedupKeys = ['single_end']
+
+include { COOLER_MAKE  } from './modules/local/cooler_make/main' addParams( options: [args:[assembly: Assembly]] )
+
+
+// Define workflow
+workflow REDC {
+
+    /* Prepare input */
+    // Check input FASTQ files
+    Fastq = INPUT_CHECK_DOWNLOAD( file(InputSamplesheet) )
+
+//    /* Check quality with FASTQC */
+//    FASTQC( Fastq )
+
+    /* Split into chunks */
+    if (chunksize) {
+        /* Run subworkflow that takes fastq stream and outputs chunks: */
+        FastqChunks = INPUT_SPLIT( Fastq )
     }
     else {
-        // Download/copy genomic fasta
-        def fasta_file = params.genome.get("fasta", "")
-        def suffix = isGZ(fasta_file) ? ".gz" : ""
-
-        // Get FASTA from URL or copy
-        def getGenomeCmd = ""
-        if (isURL(fasta_file)){
-            getGenomeCmd = """
-                wget ${fasta_file} -O ${assembly}.fa${suffix}
-            """
-        }
-        else {
-            getGenomeCmd = """
-                cp ${fasta_file} ${assembly}.fa${suffix}
-            """
-        }
-
-        // Unpack genomic fasta
-        def unpackGenomeCmd = ""
-        if (isGZ(fasta_file)){
-            unpackGenomeCmd = """
-                bgzip -d -@ ${task.cpus} ${assembly}.fa.gz
-            """
-        }
-
-        // Download/copy/build chromosome sizes
-        def chromsizes_file = params.genome.get("chromsizes", "")
-        def getChromsizesCmd = ""
-        if (isURL(chromsizes_file)){
-            getChromsizesCmd = """
-                wget ${chromsizes_file} -O ${assembly}.chromsizes.txt
-            """
-        }
-        else if (chromsizes_file.size()>0) {
-            getChromsizesCmd = """
-                cp ${chromsizes_file} ${assembly}.chromsizes.txt
-            """
-        }
-        else {
-            getChromsizesCmd = """
-                faidx ${assembly}.fa -i chromsizes > ${assembly}.chromsizes.txt
-            """
-        }
-
-        // Run index if it does not exist or fasta file was downloaded from URL
-        suffix_list = [".1.ht2", ".2.ht2", ".3.ht2", ".4.ht2", ".5.ht2", ".6.ht2", ".7.ht2", ".8.ht2"]
-        def getIndexCmd = ""
-        if ((params.genome.get('index_prefix', '').size()==0) | (isURL(fasta_file))) {
-            getIndexCmd = "hisat2-build -p ${task.cpus} ${assembly}.fa ${assembly}.fa"
-        } else {
-            for (suf in suffix_list) {
-                getIndexCmd = getIndexCmd + "cp ${params.genome.index_prefix}${suf} ${assembly}.fa${suf}; "
-            }
-        }
-
-        """
-        ${getGenomeCmd}
-        ${unpackGenomeCmd}
-        ${getChromsizesCmd}
-        ${getIndexCmd}
-        """
-    }
-}
-
-if (check_restriction) {
-    LIST_RENZ = Channel.fromList(params.protocol.renz.collect{k, v -> [k, v]})
-    process RESTRICT_GENOME{
-        tag "${assembly} ${renz}"
-        storeDir getOutputDir('genome')
-
-        input:
-        val(assembly) from GENOME_ASSEMBLY
-        file(genome_fasta) from GENOME_FASTA // "${assembly}.fa.gz"
-        set renz_key, renz from LIST_RENZ
-
-        output:
-        set renz_key, "${assembly}.${renz}.bed" into GENOME_RENZ
-
-        script:
-        """
-        detect_restriction_sites.py ${genome_fasta} ${renz} ${assembly}.${renz}.nonsorted.bed
-        sort -k1,1 -k2,2n --parallel=${task.cpus} ${assembly}.${renz}.nonsorted.bed > ${assembly}.${renz}.bed
-        """
-    }
-}
-
-////////////////////////////////
-/*   PREPARE RNA ANNOTATION   */
-////////////////////////////////
-
-Channel.from(params.rna_annotation.get('rna_annotation_name', 'rna'))
-       .combine(PREPROCESSING_TO_RNA).set{GENOME_RNA_ANNOT_NAME}
-
-process PREPARE_RNA_ANNOTATION{
-    tag "${rna_annot_name}"
-    storeDir getOutputDir('genome')
-
-    input:
-    set val(rna_annot_name), val(preprocessing_output) from GENOME_RNA_ANNOT_NAME
-
-    output:
-    file "${rna_annot_name}.spliced_genes.txt" into GENOME_SPLICESITES
-    file "${rna_annot_name}.gtf" into RNA_ANNOT_FILE
-
-    script:
-    def suffix = isGZ(params.rna_annotation.genes_gtf) ? ".gz" : ""
-    def getRNAAnnot = ""
-    if (isURL(params.rna_annotation.genes_gtf)) {
-        getRNAAnnot = """
-        wget ${params.rna_annotation.genes_gtf} -O ${rna_annot_name}.gtf${suffix}
-        """
-    }
-    else {
-        getRNAAnnot = """
-        cp ${params.rna_annotation.genes_gtf} ${rna_annot_name}.gtf${suffix}
-        """
-    }
-    def unpackRNAAnnot = ""
-    if (isGZ(params.rna_annotation.genes_gtf)){
-        unpackRNAAnnot = """
-            bgzip -d -@ ${task.cpus} ${rna_annot_name}.gtf.gz
-        """
+        FastqChunks = Fastq
     }
 
-    """
-    ${getRNAAnnot}
-    ${unpackRNAAnnot}
-    hisat2_extract_splice_sites.py ${rna_annot_name}.gtf > ${rna_annot_name}.spliced_genes.txt
-    """
-}
+    /* Prepare genome and annotations */
+
+    // Retrieve index, chromosome sizes and fasta:
+    AssemblyInput = Channel.from([[Assembly, file(InputSamplesheet)]])
+    GenomeComplete = GENOME_PREPARE( AssemblyInput )
+    Hisat2Index = GenomeComplete.genome_index
+    GenomeFasta = GenomeComplete.genome_fasta
+    ChromSizes = GenomeComplete.genome_chromsizes
+
+    // Restrict the genome or load pre-computed restriction sites
+    if (check_restriction) {
+        Renzymes = Channel.fromList(params.protocol.renzymes)
+                             // Restrict only missing renzymes, create two channel branches:
+                             // forRestriction and loaded (restriction is pre-computed)
+                                .branch { it ->
+                                    forRestriction : !RenzymesPreloaded.containsKey(it)
+                                        return [renzyme: it, assembly: Assembly]
+                                    loaded : RenzymesPreloaded.containsKey(it)
+                                        return [[renzyme: it, assembly: Assembly], file(RenzymesPreloaded[it])]
+                                }
+
+        Restricted = GENOME_RESTRICT(Renzymes.forRestriction, GenomeFasta).genome_restricted.mix( Renzymes.loaded )
+        // Create separate channels for +, - and +/- (both) strand orientations of enzymes recognition:
+        RestrictedPlus = Restricted.map{ update_meta(it, [renz_strand: "+"] ) }
+        RestrictedMinus = Restricted.map{ update_meta(it, [renz_strand: "-"] ) }
+        RestrictedBoth = Restricted.map{ update_meta(it, [renz_strand: "b"] ) }
+        // Mix all channels with annotated restriction recognition sites to a single channel:
+        RestrictedChannel = RestrictedPlus.mix(RestrictedMinus).mix(RestrictedBoth)
+    }
+
+    // Get genomic splice sites by hisat2 script:
+    SpliceSites = GENOME_PREPARE_RNA_ANNOTATIONS( Assembly ).genome_splicesites
+
+    /* Convert input reads to text table */
+    TableChunks = TABLE_FASTQ2TSV( FastqChunks ).table
+
+    /* Trim reads by quality */
+    TrimTable = TABLE_TRIM( FastqChunks, TableChunks ).trimtable
+
+    /* Map and check oligos */
+    Hits = OLIGOS_MAP( FastqChunks, TableChunks ) /* Subworkflow for oligos mapping */
+
+    /* Tables with read, trimming and mapped oligo: */
+    // Create synchronized multichannel with tables:
+    TablesGroupedInput = TableChunks.mix(TrimTable) // Mix all oligos-related channels into a single channel:
+                                    .mix(Hits.HitsOligos)
+                                    .mix(Hits.HitsShortOligos)
+                                    .mix(Hits.HitsComplementary)
+                               // Remove oligo parameters from metadata:
+                                    .map{ removeKeys(it, oligoKeys ) }
+                               // Group by metadata, which should be identical for the same sample/chunk
+                               // Note that group size depends on the number of oligos and short oligos:
+                                    .groupTuple(by:0, sort:true)
+                               // Combine with channel with empty suffixes
+                                    .combine(Channel.from(['']))
+                               // Create restructured multi-channel:
+                                    .multiMap{it ->
+                                        table: [it[0], it[1]]
+                                        suffixes: it[2]
+                                    }
+    // Merge all the tables in a single file for each sample/chunk:
+    MergedTable = TABLE_MERGE( TablesGroupedInput ).table
+
+    // Convert the table file format for better storage/operations:
+    Table = TABLE_CONVERT( MergedTable ).table
+
+    /* Deduplicate input sequences */
+
+    // Run subworkflow that trims first basepairs of reads and runs fastuniq on them:
+    if (runFastuniq){
+        FastuniqOut = TABLE_DEDUP( Fastq )
+
+        // Align deduplicated reads with read table
+        // (we want to guarantee the same order of reads in each table):
+        DedupAlignInput = Table.combine(FastuniqOut).filter{ it[0].original_id==it[2].id }
+                                    .multiMap{ it ->
+                                        reference: [ it[0], it[3] ]
+                                        table: [ it[0], it[1] ]
+                                    }
+        TableDedup = TABLE_DEDUP_ALIGN( DedupAlignInput ).table.map{ removeKeys(it, dedupKeys) }
 
-////////////////////////////////////////////////
-/*      PREPARE FASTQ FILES AND READ TABLE    */
-////////////////////////////////////////////////
-/*
-download fastq from SRA, split into chunks.
-*/
-
-Channel.from(params.input.fastq_paths
-    .collect{k, v ->  [k, v]}
-    )
-    .branch{
-        for_download: isSRA(it[1][0])
-        local:       !isSRA(it[1][0])
-    }.set{FASTQ_PATHS}
-
-/*
- * STEP 0: Download SRA
- */
-
-process DOWNLOAD_FASTQ {
-    tag "library:${library}"
-
-    storeDir getOutputDir('fastq')
-
-    input:
-    tuple val(library), val(name) from FASTQ_PATHS.for_download
-
-    output:
-    tuple val(library), "${library}_1.fastq.gz", "${library}_2.fastq.gz" into DOWNLOADED
-
-    script:
-    def sra = ( name=~ /SRR\d+/ )[0]
-    """
-    fastq-dump ${sra} -Z --split-spot \
-                   | pyfilesplit --lines 4 \
-                     >(bgzip -c -@${task.cpus} > ${library}_1.fastq.gz) \
-                     >(bgzip -c -@${task.cpus} > ${library}_2.fastq.gz) \
-                     | cat
-    """
-
-}
-
-FASTQ_PATHS.local.map { it -> [ it[0], file(it[1][0]), file(it[1][1]) ] }
-    .concat(DOWNLOADED).into{ LIB_FASTQ; LIB_VIEW;
-                              LIB_FASTQ_TO_FASTUNIQ }
-
-//Channel.from(
-//    params.input.fastq_paths.collect{k, v ->  [k, v[0], file(v[0]), v[1], file(v[1])]}
-//    ).set{LIB_FASTQ}
-//Channel.from(
-//    params.input.fastq_paths.collect{k, v ->  [k, file(v[0]), file(v[1])]}
-//    ).set{LIB_FASTQ_TO_FASTUNIQ}
-//
-def chunksize = params.run.chunksize*4
-
-process SPLIT_FASTQ_INTO_CHUNKS{
-    tag "library:${library}"
-
-    storeDir getOutputDir('fastq')
-
-    input:
-    set val(library), path(input_fq1), path(input_fq2) from LIB_FASTQ
-
-    output:
-    set val(library), "${library}.*.1.fq", "${library}.*.2.fq" into LIB_SPLIT_FASTQ_RAW
-
-    script:
-    def readCmd = (isGZ(input_fq1.toString())) ?  "bgzip -dc -@ ${task.cpus}" : "cat"
-
-    """
-    echo
-    ${readCmd} ${input_fq1} | split -l ${chunksize} --numeric-suffixes=1 \
-        --additional-suffix=".1.fq" - ${library}.
-    ${readCmd} ${input_fq2} | split -l ${chunksize} --numeric-suffixes=1 \
-        --additional-suffix=".2.fq" - ${library}.
-    """
-}
-
-LIB_SPLIT_FASTQ_RAW
-    .transpose()
-    .map{[it[0],
-          parseChunkPair(it[1],it[2]), // index of the chunk (checked for safety)
-          it[1],
-          file(it[1]),
-          it[2],
-          file(it[2])]}
-    .into{ LIB_SPLIT_FASTQ_TO_TABLE;
-           LIB_SPLIT_FASTQ_TO_TRIM;
-           LIB_SPLIT_FASTQ_TO_CINDEX }
-
-/*
-Merge fastq files into read table.
-Each line in the resulting table corresponds to a single read.
-This step saves time for further processing.
-Next, it will be processed with bash-only approach.
-*/
-
-process CREATE_READS_TABLE_CHUNKS{
-    tag "library:${library} chunk:${chunk}"
-
-    storeDir getOutputDir('table')
-
-    input:
-    set val(library), val(chunk), val(input1), file(input_fq1), val(input2), file(input_fq2) from LIB_SPLIT_FASTQ_TO_TABLE
-
-    output:
-    set library, chunk, "${library}.${chunk}.fastq.txt" into LIB_TABLE_FASTQ
-
-    script:
-    """
-    paste <(awk '{print \$1}' ${input_fq1} | sed 'N;N;N;s/\\n/ /g' | \
-            awk 'BEGIN{OFS="\\t"}{print \$1, "${library}.${chunk}", \$2, \$4}' ) \
-          <(awk '{print \$1}' ${input_fq2} | sed 'N;N;N;s/\\n/ /g' | \
-            awk 'BEGIN{OFS="\\t"}{print \$2, \$4}' ) > ${library}.${chunk}.fastq.txt
-    """
-}
-
-LIB_TABLE_FASTQ.into{ LIB_TABLE_FASTQ_FOR_TRIM;
-                      LIB_TABLE_FASTQ_FOR_GA;
-                      LIB_TABLE_FASTQ_FOR_RNACOMP;
-                      LIB_TABLE_FASTQ_FOR_SUBSTR;
-                      LIB_TABLE_FASTQ_FOR_COLLECT}
-
-////////////////////////////////
-/*       DEDUPLICATION        */
-////////////////////////////////
-/*
-In RedC.nf I take an unusual approach and deduplicate before the mapping.
-This decision was made because we need the statistics on bridge/adapters presence for already deduplicated reads.
-
-Detect unique sequences based on N nucleotides at 5'-ends. N is defined by params.run.fastuniq_basepairs (50 by default)
-Two-step procedure:
-    1) crop first basepairs for both forward and reverse FASTQ file. Usually, errors are less frequent at 5'-end of read
-    2) remove duplicated sequences with fastuniq
-*/
-
-def cropped_length = params.run.fastuniq_crop
-
-process DEDUP{
-    tag "library:${library}"
-
-    storeDir getOutputDir('table')
-
-    input:
-    set val(library), file(input_fq1), file(input_fq2) from LIB_FASTQ_TO_FASTUNIQ
-
-    output:
-    set library, "${library}.ids.unique.txt" into IDS_FASTUNIQ
-
-    script:
-    """
-    # Trim N basepairs
-    trimmomatic PE -threads ${task.cpus} ${input_fq1} ${input_fq2} \
-                                         ${library}_1P ${library}_1U \
-                                         ${library}_2P ${library}_2U CROP:${cropped_length}
-
-    # Create input file for fastuniq
-    echo ${library}_1P >  filelist.txt
-    echo ${library}_2P >> filelist.txt
-
-    # Run fastuniq
-    fastuniq -i filelist.txt -tq -c 0 -o ${library}.1.unique.fq -p ${library}.2.unique.fq
-
-    # Parse fastuniq output
-    awk 'NR%4==1' ${library}.1.unique.fq | gawk '{match(\$0, "@([^ ,/]+)", a)} {print a[1]}' \
-        > ${library}.ids.unique.txt
-
-    """
-}
-
-////////////////////////////////
-/*          TRIMMING          */
-////////////////////////////////
-/*
-Trim reads by quality with trimmomatic.
-*/
-
-def params_trimmomatic = params.run.params_trimmomatic
-
-process TRIM_CHUNKS{
-    tag "library:${library} chunk:${chunk}"
-
-    storeDir getOutputDir('table')
-
-    input:
-    set val(library), val(chunk),
-        val(input1), file(input_fq1),
-        val(input2), file(input_fq2) from LIB_SPLIT_FASTQ_TO_TRIM
-
-    output:
-    set library, chunk, "${library}.${chunk}.1.trimmed.fq", "${library}.${chunk}.2.trimmed.fq" into LIB_TRIMMED
-
-    script:
-    """
-    # Trim with specified parameters
-    trimmomatic PE -phred33 -threads ${task.cpus} ${input_fq1} ${input_fq2} \
-                            ${library}.${chunk}.1.trimmed.fq ${library}_1U \
-                            ${library}.${chunk}.2.trimmed.fq ${library}_2U ${params_trimmomatic}
-    """
-}
-
-// Structure of the channel:
-// library, chunk, processed_table, processed_fq1, processed_fq2
-LIB_TABLE_FASTQ_FOR_TRIM
-    .combine(LIB_TRIMMED, by: [0, 1] )
-    .map { it ->  [it[0], it[1], file(it[2]), file(it[3]), file(it[4]) ] }
-    .set { LIB_FOR_GET_TRIM_OUTPUT }
-
-process CREATE_TRIM_TABLE_CHUNKS{
-    tag "library:${library} chunk:${chunk}"
-
-    storeDir getOutputDir('table')
-
-    input:
-    set val(library), val(chunk), file(input_table), file(input_fq1), file(input_fq2) from LIB_FOR_GET_TRIM_OUTPUT
-
-    output:
-    set library, chunk, "${library}.${chunk}.trimtable.txt" into LIB_TRIMTABLE
-
-    script:
-    """
-    paste <(sed -n '1~4p' ${input_fq1} | awk 'BEGIN{OFS="\\t"}{print "${library}.${chunk}", "trimmomatic", \$1}') \
-          <(sed -n '2~4p' ${input_fq1} | awk 'BEGIN{OFS="\\t"}{print 0, length(\$0);}') \
-          <(sed -n '2~4p' ${input_fq2} | awk 'BEGIN{OFS="\\t"}{print 0, length(\$0);}') \
-          > ${library}.${chunk}.trim.info
-
-    awk 'NR==FNR {vals[\$3] = \$1 "\\t" \$2 "\\t" \$3 "\\t" \$4 "\\t" \$5 "\\t" \$6 "\\t" \$7 ; next} \
-        !(\$1 in vals) {vals[\$1] = "${library}.${chunk}" "\\t" "trimmomatic" "\\t" \$1 "\\t" "0\\t0\\t0\\t0"} \
-        {\$(NF+1) = vals[\$1]; print vals[\$1]}' ${library}.${chunk}.trim.info ${input_table} \
-        > ${library}.${chunk}.trimtable.txt
-    """
-}
-
-////////////////////////////////
-/*      OLIGOS ALIGNMENT      */
-////////////////////////////////
-/*
-For the alignment of oligos, we run the custom mapper based on Karp–Rabin algorithm.
-Input fastq files with reads and files with oligos are indexed first, and then processed with custon C aligner.
-*/
-
-LIB_OLIGOS_RAW = Channel.from(
-    params.input.oligos.collect{k, v ->  [k, v, file(v)]}
-    ).combine(PREPROCESSING)
-
-process INDEX_OLIGOS{
-    tag "oligo:${oligo}"
-
-    storeDir getOutputDir('cindex')
-
-    input:
-    set val(oligo), input_oligo, file(input_oligo_fa), val(preprocessing_output) from LIB_OLIGOS_RAW
-
-    output:
-    set oligo, "${oligo}.bin" into LIB_OLIGOS_CINDEX
-
-    script:
-    """
-    fasta2bin ${input_oligo_fa} ${oligo}.bin
-    """
-}
-
-process INDEX_CHUNKS{
-    tag "library:${library} chunk:${chunk}"
-
-    storeDir getOutputDir('cindex')
-
-    input:
-    set val(library), val(chunk),
-        val(input1), file(input_fq1),
-        val(input2), file(input_fq2) from LIB_SPLIT_FASTQ_TO_CINDEX
-
-    output:
-    set library, chunk, "${library}.${chunk}.1.bin", "${library}.${chunk}.2.bin" into LIB_FASTQ_CINDEX
-
-    script:
-    """
-    fastq2bin ${input_fq1} ${library}.${chunk}.1.bin
-    fastq2bin ${input_fq2} ${library}.${chunk}.2.bin
-    """
-}
-
-def br_length = params.protocol.bridge_length
-
-// Read length for each library
-Channel.fromList(params.protocol.read_length.collect{k, v -> [k, v]})
-    .into{ LIST_RLENGTHS_COLLECTION1; LIST_RLENGTHS_COLLECTION2}
-
-// def read_length = params.protocol.read_length
-
-// Set required oligos mapping and parameters of mapping calls:
-MAPPING_COLLECTION1 = LIST_RLENGTHS_COLLECTION1.flatMap { lib, read_length ->
-    [[library: lib, oligo: "adaptor_forward", apply_to:1, right_shift:read_length-14, read_length:read_length,
-    n_primers:params.input.oligos_variants.adaptor_forward, left_shift:-6, mismatch_general:1, report_len:20],
-    [library: lib, oligo: "adaptor_reverse", apply_to:1, right_shift: read_length-14, read_length:read_length,
-    n_primers:params.input.oligos_variants.adaptor_reverse, left_shift:-6, mismatch_general:1, report_len:20],
-    [library: lib, oligo: "adaptor_reverse_short", apply_to:1, right_shift:read_length-14, read_length:read_length,
-    n_primers:params.input.oligos_variants.adaptor_reverse_short, left_shift:0, mismatch_general:1, report_len:16],
-    [library: lib, oligo: "bridge_forward", apply_to:1, right_shift:read_length-14, read_length:read_length,
-    n_primers:params.input.oligos_variants.bridge_forward, left_shift:0, mismatch_general:1, report_len:br_length],
-    [library: lib, oligo: "bridge_reverse", apply_to:1, right_shift:read_length-14, read_length:read_length,
-    n_primers:params.input.oligos_variants.bridge_reverse, left_shift:0, mismatch_general:1, report_len:br_length]]
-}
-
-MAPPING_COLLECTION2 = LIST_RLENGTHS_COLLECTION2.flatMap { lib, read_length ->
-    [[library: lib, oligo: "adaptor_forward", apply_to:2, right_shift:read_length-14, read_length:read_length,
-    n_primers:params.input.oligos_variants.adaptor_forward, left_shift:-6, mismatch_general:1, report_len:20],
-    [library: lib, oligo: "adaptor_reverse", apply_to:2, right_shift:read_length-14, read_length:read_length,
-    n_primers:params.input.oligos_variants.adaptor_reverse, left_shift:-6, mismatch_general:1, report_len:20],
-    [library: lib, oligo: "bridge_forward", apply_to:2, right_shift:read_length-14, read_length:read_length,
-    n_primers:params.input.oligos_variants.bridge_forward, left_shift:0, mismatch_general:1, report_len:br_length],
-    [library: lib, oligo: "bridge_reverse", apply_to:2, right_shift:read_length-14, read_length:read_length,
-    n_primers:params.input.oligos_variants.bridge_reverse, left_shift:0, mismatch_general:1, report_len:br_length],
-    [library: lib, oligo: "ggg", apply_to:2, right_shift:3, read_length:read_length,
-    n_primers:params.input.oligos_variants.ggg, left_shift:0, mismatch_general:0, report_len:3]]
-}
-
-// Split channels for forward and reverse sides of read:
-LIB_OLIGOS_CINDEX.into { LIB_OLIGOS_CINDEX1; LIB_OLIGOS_CINDEX2 }
-LIB_FASTQ_CINDEX.into { LIB_FASTQ_CINDEX1; LIB_FASTQ_CINDEX2;
-                        LIB_FASTQ_CINDEX_FOR_RNACOMP;
-                        LIB_FASTQ_CINDEX_FOR_SUBSTR}
-
-
-// 0          1            2       3     4          5          6
-// oligo_name olifo_cindex library chunk fq1_cindex fq2_cindex params
-LIB_OLIGOS_CINDEX1.combine(LIB_FASTQ_CINDEX1).combine(MAPPING_COLLECTION1)
-    .filter { it[0]==it[6]["oligo"] && it[2]==it[6]["library"] }
-    .map { it ->  [it[0], file(it[1]), it[2], it[3], file(it[4]), it[6].apply_to, it[6], it[6]["read_length"] ] }
-    .set { LIB_FOR_OLIGOS_MAPPING1 }
-
-LIB_OLIGOS_CINDEX2.combine(LIB_FASTQ_CINDEX2).combine(MAPPING_COLLECTION2)
-    .filter { it[0]==it[6]["oligo"] && it[2]==it[6]["library"] }
-    .map { it ->  [it[0], file(it[1]), it[2], it[3], file(it[5]), it[6].apply_to, it[6], it[6]["read_length"]  ] }
-    .set { LIB_FOR_OLIGOS_MAPPING2 }
-
-LIB_FOR_OLIGOS_MAPPING = LIB_FOR_OLIGOS_MAPPING1.concat(LIB_FOR_OLIGOS_MAPPING2)
-
-
-
-// Encoding the length of the reads for C program:
-def lengths = [101:15, 151:21, 125:18, 80:12, 133:19, 251:34]
-
-process SEARCH_OLIGOS_CHUNKS{
-    tag "library:${library} chunk:${chunk} side:${apply_to} oligo:${oligo}"
-
-    storeDir getOutputDir('cout')
-
-    input:
-    set val(oligo), file(oligo_cindex), val(library), val(chunk),
-        file(fq_cindex), val(apply_to), val(map_params), val(read_length) from LIB_FOR_OLIGOS_MAPPING
-
-    output:
-    set library, chunk, oligo, apply_to, "${library}.${chunk}.${apply_to}.${oligo}.txt", read_length into LIB_MAPPED_OLIGOS
-
-    script:
-    def seqlen_converted = lengths[ map_params.read_length ]
-    """
-    align_universal ${oligo_cindex} ${fq_cindex} 1 ${map_params.read_length} ${seqlen_converted} \
-      ${map_params.n_primers} ${map_params.left_shift} ${map_params.right_shift} \
-      ${map_params.mismatch_general} 0 ${map_params.report_len} > ${library}.${chunk}.${apply_to}.${oligo}.txt
-    """
-}
-
-LIB_MAPPED_OLIGOS.into{ LIB_MAPPED_OLIGOS_FOR_GA;
-                        LIB_MAPPED_OLIGOS_FOR_RNACOMP;
-                        LIB_MAPPED_OLIGOS_FOR_SUBSTR;
-                        LIB_MAPPED_OLIGOS_FOR_COLLECT}
-
-// Resulting Channel structure: library, chunk, fastq_table, mapped_oligo
-LIB_TABLE_FASTQ_FOR_GA
-    .combine( LIB_MAPPED_OLIGOS_FOR_GA, by: [0, 1])
-    .filter{ it[3]=="bridge_forward" && it[4]==1 }
-    .map{ [it[0], it[1], file(it[2]), file(it[5])]  }
-    .set{ LIB_FOR_GA }
-
-process CHECK_GA{
-    tag "library:${library} chunk:${chunk}"
-
-    storeDir getOutputDir('table')
-
-    input:
-    set val(library), val(chunk), file(table_fq), file(cout_br_for) from LIB_FOR_GA
-
-    output:
-    set library, chunk, "${library}.${chunk}.GA.txt" into LIB_MAPPED_GA
-
-    script:
-    def checkGACmd=""
-    if (params.run.get('check_GA', true)) {
-        checkGACmd="check_oligo_presence.py ${table_fq} ${cout_br_for} ${library}.${chunk}.GA.txt"
     } else {
-        checkGACmd="awk '{print NR-1\"\\t0\"}' ${table_fq} > ${library}.${chunk}.GA.txt"
+        TableDedup = Channel.empty()
     }
-    """
-    ${checkGACmd}
-    """
-}
 
 
-////////////////////////////////
-/*    CHECK COMPLEMENTARY     */
-////////////////////////////////
-/*
-Extract RNA regions and check for presence at the opposite side of read in a pair.
-*/
-
-// Resulting Channel structure: library, chunk, fastq_table, mapped_oligo1, mapped_oligo2
-LIB_TABLE_FASTQ_FOR_RNACOMP
-    .combine(LIB_MAPPED_OLIGOS_FOR_RNACOMP, by: [0, 1]) //Channel structure: library, chunk, fastq_table, oligo_name, forward-reverse-flag, cout, readlen
-    .branch {
-        bridge_forward: it[3]=="bridge_forward"
-        ggg: it[3]=="ggg"
-    }.combine()     //Channel structure: library1, chunk1, fastq_table1, oligo_name1, forward-reverse-flag1, cout1, readlen1, library2, chunk2, fastq_table2, oligo_name2, forward-reverse-flag2, cout2, readlen2
-    .filter{
-        it[0]==it[7] && it[1]==it[8] && it[4]==1 && it[11]==2
+    /* Collect fragment columns data. */
+    // params.fragments has the list of new columns with expressions that will be evaluated for each fragment
+    // Take params.fragments and collect columns:
+    def FragmentCollection = [:]
+    for (fragment_name in params.fragments.keySet()){ // select all fragments
+        fragment_params = params.fragments[fragment_name] // take the parameters for each fragment
+        for( col in fragment_params.new_columns.keySet() ) { // add new columns to the list
+            FragmentCollection[col] = fragment_params.new_columns[col]
+        }
     }
-    .map{
-        [it[0], it[1], file(it[2]), file(it[5]), file(it[12]), it[13] ]
-    }     //Channel structure: library1, chunk1, file(fastq_table1), file(cout1), file(cout2), readlen2
-    .combine(LIB_FASTQ_CINDEX_FOR_RNACOMP, by:[0,1])
-    .set { LIB_FOR_RNACOMP }
 
-
-process CHECK_COMPLEMENTARY_RNA_CHUNKS{
-    tag "library:${library} chunk:${chunk}"
-
-    storeDir getOutputDir('cout')
-
-    input:
-    set val(library), val(chunk), file(table_fq),
-        file(cout_br_for), file(cout_ggg_rev), read_length,
-        file(cindex_fq1), file(cindex_fq2) from LIB_FOR_RNACOMP
-
-    output:
-    set library, chunk, "${library}.${chunk}.1.rnacomp.txt", "${library}.${chunk}.2.rnacomp.txt" into LIB_COUT_RNACOMP
-
-    script:
-
-    def rna_complementary_length = params.run.rna_complementary_length
-    def rna_comp_length_converted = ((rna_complementary_length+3).intdiv(8))+1
-    def extraN = "N"*(500+3*rna_complementary_length)
-    def seqlen_converted = lengths[ read_length ]
-    """
-    # Get the complemetary regions
-    paste <(awk '{print \$1, \$3, \$4}' ${table_fq}) \
-          <(head -n -1 ${cout_br_for} | tail -n +2 | awk '{print \$4}') \
-          | awk 'BEGIN{OFS="\\n";} {bgn=1; if (\$4<500) bgn=\$4+${br_length}+1; \
-          print \$1, substr(\$2"${extraN}", bgn, ${rna_complementary_length}), \
-          "+", substr(\$3"${extraN}", bgn, ${rna_complementary_length})}' > ${library}.${chunk}.rna-end.1.fq
-
-    paste <(awk '{print \$1, \$5, \$6}' ${table_fq}) \
-          <(head -n -1 ${cout_ggg_rev} | tail -n +2 | awk '{print \$5+1}') \
-          | awk 'BEGIN{OFS="\\n";} {bgn=1; if (\$4<500) bgn=\$4;
-          print \$1, substr(\$2"${extraN}", bgn, ${rna_complementary_length}), \
-          "+", substr(\$3"${extraN}", bgn, ${rna_complementary_length})}' > ${library}.${chunk}.rna-end.2.fq
-
-    # Convert to reverse complement
-    paste <(sed -n '1~4p' ${library}.${chunk}.rna-end.1.fq) \
-          <(sed -n '2~4p' ${library}.${chunk}.rna-end.1.fq | rev | tr "ATGC" "TACG") \
-          <(sed -n '3~4p' ${library}.${chunk}.rna-end.1.fq) \
-          <(sed -n '4~4p' ${library}.${chunk}.rna-end.1.fq | rev) | tr "\\t" "\\n" \
-          > ${library}.${chunk}.rna-end.1.revcomp.fq
-
-    paste <(sed -n '1~4p' ${library}.${chunk}.rna-end.2.fq) \
-          <(sed -n '2~4p' ${library}.${chunk}.rna-end.2.fq | rev | tr "ATGC" "TACG") \
-          <(sed -n '3~4p' ${library}.${chunk}.rna-end.2.fq) \
-          <(sed -n '4~4p' ${library}.${chunk}.rna-end.2.fq | rev) | tr "\\t" "\\n" \
-          > ${library}.${chunk}.rna-end.2.revcomp.fq
-
-    # Convert to binary file
-    fastq2bin ${library}.${chunk}.rna-end.1.revcomp.fq ${library}.${chunk}.rna-end.1.revcomp.bin
-    fastq2bin ${library}.${chunk}.rna-end.2.revcomp.fq ${library}.${chunk}.rna-end.2.revcomp.bin
-
-    # Align complementary regions to each library
-    align_pairwise ${library}.${chunk}.rna-end.2.revcomp.bin ${cindex_fq1} 1 ${read_length} \
-                   ${seqlen_converted} ${rna_comp_length_converted} 0 \
-                   ${read_length-rna_complementary_length} \
-                   1 0 ${rna_complementary_length} > ${library}.${chunk}.1.rnacomp.txt
-
-    align_pairwise ${library}.${chunk}.rna-end.1.revcomp.bin ${cindex_fq2} 1 ${read_length} \
-               ${seqlen_converted} ${rna_comp_length_converted} 0 \
-               ${read_length-rna_complementary_length} \
-               1 0 ${rna_complementary_length} > ${library}.${chunk}.2.rnacomp.txt
-
-    """
-}
-
-////////////////////////////////
-/*       GET SUBSTRINGS       */
-////////////////////////////////
-/*
-Extract DNA, and two RNA regions from FASTQ baed on the mappings.
-*/
-
-LIB_MAPPED_OLIGOS_FOR_SUBSTR.into {
-    LIB_MAPPED_OLIGOS_FOR_SUBSTR_DNA;
-    LIB_MAPPED_OLIGOS_FOR_SUBSTR_RNA1;
-    LIB_MAPPED_OLIGOS_FOR_SUBSTR_RNA2;
-}
-LIB_TABLE_FASTQ_FOR_SUBSTR.into {
-    LIB_TABLE_FASTQ_FOR_SUBSTR_DNA;
-    LIB_TABLE_FASTQ_FOR_SUBSTR_RNA1;
-    LIB_TABLE_FASTQ_FOR_SUBSTR_RNA2
-}
-
-LIB_TRIMTABLE.into {
-    LIB_TRIMTABLE_FOR_SUBSTR_DNA;
-    LIB_TRIMTABLE_FOR_SUBSTR_RNA1;
-    LIB_TRIMTABLE_FOR_SUBSTR_RNA2;
-    LIB_TRIMTABLE_FOR_COLLECT
-}
-
-/* Get DNA substrings */
-
-LIB_MAPPED_OLIGOS_FOR_SUBSTR_DNA
-    .branch{
-        bridge_forward:  it[2]=="bridge_forward"  && it[3]==1
-        adaptor_forward: it[2]=="adaptor_forward" && it[3]==1
-    }.set{LIB_MAPPED_BRANCHED_FOR_DNA}
-
-LIB_TABLE_FASTQ_FOR_SUBSTR_DNA
-    .combine(LIB_MAPPED_BRANCHED_FOR_DNA.bridge_forward, by:[0,1])  // oligo1
-    .combine(LIB_MAPPED_BRANCHED_FOR_DNA.adaptor_forward, by:[0,1]) // oligo2
-    .combine(LIB_TRIMTABLE_FOR_SUBSTR_DNA, by:[0,1])
-    .map{
-        library, chunk, table_fastq,
-        oligo1, side1, file_oligo1, read_length1,
-        oligo2, side2, file_oligo2, read_length2,
-        trim_table
-        -> [library, chunk, table_fastq, file_oligo1, file_oligo2, trim_table, read_length1]
-    }.set{ LIB_FOR_SUBSTR_DNA }
-
-process GET_DNA_FRAGMENTS_CHUNKS{
-    tag "library:${library} chunk:${chunk}"
-
-    storeDir getOutputDir('filtered_fastq')
-
-    input:
-    set val(library), val(chunk), file(fastq_table),
-        file(cout_r1_br_for), file(cout_r1_for),
-        file(trim_table), val(read_length) from LIB_FOR_SUBSTR_DNA
-
-    output:
-    set library, chunk, "${library}.${chunk}.dna_nonextended.fq" into LIB_SUBSTR_DNA
-    set library, chunk, "${library}.${chunk}.dna.fq" optional true into LIB_SUBSTR_DNA_EXT
-    set library, chunk, "${library}.${chunk}.dna.info.txt" into LIB_SUBSTR_DNA_INFO
-
-    script:
-    def limit = params.run.min_substring_size
-
-    def extended_Cmd = ""
-    def qual_extension = ""
-    if (dna_extension.size()>0) {
-        qual_extension = "~"*dna_extension.size()
-        extended_Cmd = """
-        paste <(awk '{print \$1, \$3, \$4}' ${fastq_table}) \
-              <(head -n -1 ${cout_r1_for} | tail -n +2 | awk '{print \$5+1}') \
-              <(awk '{print \$5}' ${trim_table}) \
-              <(head -n -1 ${cout_r1_br_for} | tail -n +2 | awk '{print \$4}') \
-              | awk 'BEGIN{OFS="\\n";} {bgn=1; if (\$4<500) bgn=\$4; end=\$5; if (\$6<end) end=\$6; \
-              if (end-bgn+1>=${limit}) print \$1, substr(\$2, bgn, end-bgn+1)"${dna_extension}", \
-              "+", substr(\$3, bgn, end-bgn+1)"${qual_extension}"}' > ${library}.${chunk}.dna.fq
-        """
-    }
-    """
-    ${extended_Cmd}
-    paste <(awk '{print \$1, \$3, \$4}' ${fastq_table}) \
-          <(head -n -1 ${cout_r1_for} | tail -n +2 | awk '{print \$5+1}') \
-          <(awk '{print \$5}' ${trim_table}) \
-          <(head -n -1 ${cout_r1_br_for} | tail -n +2 | awk '{print \$4}') \
-          | awk 'BEGIN{OFS="\\n";} {bgn=1; if (\$4<500) bgn=\$4; end=\$5; if (\$6<end) end=\$6; \
-          if (end-bgn+1>=${limit}) print \$1, substr(\$2, bgn, end-bgn+1), \
-          "+", substr(\$3, bgn, end-bgn+1)}' > ${library}.${chunk}.dna_nonextended.fq
-
-    # Write info about selected segments:
-    paste <(awk '{print \$1, \$3, \$4}' ${fastq_table}) \
-          <(head -n -1 ${cout_r1_for} | tail -n +2 | awk '{print \$5+1}') \
-          <(awk '{print \$5}' ${trim_table}) \
-          <(head -n -1 ${cout_r1_br_for} | tail -n +2 | awk '{print \$4}') \
-          | awk 'BEGIN{OFS="\\t";} {bgn=1; if (\$4<500) bgn=\$4; \
-          end=${read_length}; if (\$6<end) end=\$6; \
-          print \$1, bgn, end, end-bgn+1, \$5, \$5-bgn+1}' > ${library}.${chunk}.dna.info.txt
-    """
-}
-
-LIB_COUT_RNACOMP.into { LIB_RNACOMP_TO_SUBSTR_RNA1;
-                        LIB_RNACOMP_TO_SUBSTR_RNA2 }
-
-/* Get RNA1 substrings */
-
-LIB_MAPPED_OLIGOS_FOR_SUBSTR_RNA1
-    .branch{
-        bridge_forward:  it[2]=="bridge_forward"  && it[3]==1
-        adaptor_reverse_short: it[2]=="adaptor_reverse_short" && it[3]==1
-    }.set{LIB_MAPPED_BRANCHED_FOR_RNA1}
-
-LIB_TABLE_FASTQ_FOR_SUBSTR_RNA1
-    .combine(LIB_MAPPED_BRANCHED_FOR_RNA1.bridge_forward, by:[0,1])  // oligo1
-    .combine(LIB_MAPPED_BRANCHED_FOR_RNA1.adaptor_reverse_short, by:[0,1]) // oligo2
-    .combine(LIB_RNACOMP_TO_SUBSTR_RNA1, by:[0,1])
-    .combine(LIB_TRIMTABLE_FOR_SUBSTR_RNA1, by:[0,1])
-    .map{
-        library, chunk, table_fastq,
-        oligo1, side1, file_oligo1, read_length1,
-        oligo2, side2, file_oligo2, read_length2,
-        rnacomp1, rnacomp2, trim_table
-        -> [library, chunk, table_fastq, file_oligo1, file_oligo2, rnacomp1, trim_table, read_length1]
-    }.set{ LIB_FOR_SUBSTR_RNA1 }
-
-process GET_RNA1_FRAGMENTS_CHUNKS{
-    tag "library:${library} chunk:${chunk}"
-
-    storeDir getOutputDir('filtered_fastq')
-
-    input:
-    set val(library), val(chunk), file(fastq_table),
-        file(cout_r1_br_for), file(cout_r1_rev),
-        file(cout_compl_1), file(trim_table), val(read_length) from LIB_FOR_SUBSTR_RNA1
-
-    output:
-    set library, chunk, "${library}.${chunk}.rna1.fq" into LIB_SUBSTR_RNA1
-    set library, chunk, "${library}.${chunk}.rna1.info.txt" into LIB_SUBSTR_RNA1_INFO
-
-    script:
-    def limit = params.run.min_substring_size
-
-    """
-    paste <(awk '{print \$1, \$3, \$4}' ${fastq_table}) <(awk '{print \$5}' ${trim_table}) \
-        <(head -n -1 ${cout_r1_br_for} | tail -n +2 | awk '{print \$4}') \
-        <(head -n -1 ${cout_r1_rev} | tail -n +2 | awk '{print \$4}') \
-        <(head -n -1 ${cout_compl_1} | tail -n +2 | awk '{print \$5}') \
-        | awk 'BEGIN{OFS="\\n";} {bgn=\$4; if (\$5<500) bgn=\$5+${br_length}+1; \
-        end=\$4; if (\$6<end) end=\$6; if (\$7<end) end=\$7; \
-        if (end-bgn+1>=${limit}) print \$1, substr(\$2, bgn, end-bgn+1), \
-        "+", substr(\$3, bgn, end-bgn+1)}' > ${library}.${chunk}.rna1.fq
-
-    paste <(awk '{print \$1, \$3, \$4}' ${fastq_table}) \
-        <(awk '{print \$5}' ${trim_table}) \
-        <(head -n -1 ${cout_r1_br_for} | tail -n +2 | awk '{print \$4}') \
-        <(head -n -1 ${cout_r1_rev} | tail -n +2 | awk '{print \$4}') \
-        <(head -n -1 ${cout_compl_1} | tail -n +2 | awk '{print \$5}') \
-        | awk 'BEGIN{OFS="\\t";} {bgn=1; if (\$5<500) bgn=\$5+${br_length}+1; \
-        end=${read_length}; if (\$6<end) end=\$6; if (\$7<end) end=\$7; \
-        print \$1, bgn, end, end-bgn+1, \$4, \$4-bgn+1}' > ${library}.${chunk}.rna1.info.txt
-    """
-}
-
-
-/* Get RNA2 substrings */
-
-LIB_MAPPED_OLIGOS_FOR_SUBSTR_RNA2
-    .branch{
-        ggg:  it[2]=="ggg"  && it[3]==2
-        adaptor_forward: it[2]=="adaptor_forward" && it[3]==2
-        bridge_reverse:  it[2]=="bridge_reverse"  && it[3]==2
-    }.set{LIB_MAPPED_BRANCHED_FOR_RNA2}
-
-LIB_TABLE_FASTQ_FOR_SUBSTR_RNA2
-    .combine(LIB_MAPPED_BRANCHED_FOR_RNA2.ggg, by:[0,1])             // oligo1
-    .combine(LIB_MAPPED_BRANCHED_FOR_RNA2.adaptor_forward, by:[0,1]) // oligo2
-    .combine(LIB_MAPPED_BRANCHED_FOR_RNA2.bridge_reverse, by:[0,1])  // oligo3
-    .combine(LIB_RNACOMP_TO_SUBSTR_RNA2, by:[0,1])
-    .combine(LIB_TRIMTABLE_FOR_SUBSTR_RNA2, by:[0,1])
-    .map{
-        library, chunk, table_fastq,
-        oligo1, side1, file_oligo1, read_length1,
-        oligo2, side2, file_oligo2, read_length2,
-        oligo3, side3, file_oligo3, read_length3,
-        rnacomp1, rnacomp2, trim_table
-        -> [library, chunk, table_fastq, file_oligo1, file_oligo2, file_oligo3, rnacomp2, trim_table, read_length1]
-    }.set{ LIB_FOR_SUBSTR_RNA2 }
-
-process GET_RNA2_FRAGMENTS_CHUNKS{
-    tag "library:${library} chunk:${chunk}"
-
-    storeDir getOutputDir('filtered_fastq')
-
-    input:
-    set val(library), val(chunk), file(fastq_table),
-        file(cout_r2_ggg), file(cout_r2_for), file(cout_r2_br_rev),
-        file(cout_compl_2), file(trim_table), val(read_length) from LIB_FOR_SUBSTR_RNA2
-
-    output:
-    set library, chunk, "${library}.${chunk}.rna2.fq" into LIB_SUBSTR_RNA2
-    set library, chunk, "${library}.${chunk}.rna2.info.txt" into LIB_SUBSTR_RNA2_INFO
-
-    script:
-    def limit = params.run.min_substring_size
-
-    """
-    paste <(awk '{print \$1, \$5, \$6}' ${fastq_table}) \
-        <(head -n -1 ${cout_r2_ggg} | tail -n +2 | awk '{print \$5+1}') \
-        <(head -n -1 ${cout_r2_for} | tail -n +2 | awk '{print \$5+1}') \
-        <(awk '{print \$7}' ${trim_table}) \
-        <(head -n -1 ${cout_r2_br_rev} | tail -n +2 | awk '{print \$4}') \
-        <(head -n -1 ${cout_compl_2} | tail -n +2 | awk '{print \$5}') \
-        | awk 'BEGIN{OFS="\\n";} {bgn=1; if (\$4<500) bgn=\$4; if (\$5<500 && \$5>bgn) bgn=\$5; \
-        end=\$6; if (\$7<end) end=\$7; if (\$8<end) end=\$8; \
-        if (end-bgn+1>=${limit}) print \$1, substr(\$2, bgn, end-bgn+1), \
-        "+", substr(\$3, bgn, end-bgn+1)}' > ${library}.${chunk}.rna2.fq
-
-    paste <(awk '{print \$1, \$5, \$6}' ${fastq_table}) \
-        <(head -n -1 ${cout_r2_ggg} | tail -n +2 | awk '{print \$5+1}') \
-        <(head -n -1 ${cout_r2_for} | tail -n +2 | awk '{print \$5+1}') \
-        <(awk '{print \$7}' ${trim_table}) \
-        <(head -n -1 ${cout_r2_br_rev} | tail -n +2 | awk '{print \$4}') \
-        <(head -n -1 ${cout_compl_2} | tail -n +2 | awk '{print \$5}') \
-        | awk 'BEGIN{OFS="\\t";} {bgn=1; if (\$4<500) bgn=\$4; if (\$5<500 && \$5>bgn) bgn=\$5; \
-        end=${read_length}; if (\$7<end) end=\$7; if (\$8<end) end=\$8; \
-        print \$1, bgn, end, end-bgn+1, \$6, \$6-bgn+1}' > ${library}.${chunk}.rna2.info.txt
-    """
-}
-
-////////////////////////////////
-/*           MAPPING          */
-////////////////////////////////
-/*
-Map DNA, RNA1 and RNA2 parts
-*/
-
-GENOME_INDEX.into{
-    GENOME_INDEX_FOR_DNA;
-    GENOME_INDEX_FOR_DNA_EXT;
-    GENOME_INDEX_FOR_RNA1;
-    GENOME_INDEX_FOR_RNA2
-}
-
-/* Map DNA */
-LIB_SUBSTR_DNA.combine(GENOME_INDEX_FOR_DNA)
-    .set{LIB_FOR_DNA_MAPPING}
-
-process MAP_DNA_NONEXTENDED_CHUNKS{
-    tag "library:${library} chunk:${chunk}"
-
-    storeDir getOutputDir('sam')
-
-    input:
-    set val(library), val(chunk), file(input_dna), val(index_pref), file(genome_index) from LIB_FOR_DNA_MAPPING
-
-    output:
-    set library, chunk, "${library}.${chunk}.dna_nonextended.sam" into LIB_SAM_DNA
-
-    script:
-    """
-    hisat2 -p ${task.cpus} -x ${index_pref} --no-spliced-alignment -k 100 \
-           --no-softclip -U ${input_dna} > ${library}.${chunk}.dna_nonextended.sam
-    """
-}
-
-if (dna_extension.size()>0) {
-    LIB_SUBSTR_DNA_EXT.combine(GENOME_INDEX_FOR_DNA_EXT)
-        .set{LIB_FOR_DNA_MAPPING_EXT}
-
-    process MAP_DNA_EXTENDED_CHUNKS{
-        tag "library:${library} chunk:${chunk}"
-
-        storeDir getOutputDir('sam')
-
-        input:
-        set val(library), val(chunk), file(input_dna), val(index_pref), file(genome_index) from LIB_FOR_DNA_MAPPING_EXT
-
-        output:
-        set library, chunk, "${library}.${chunk}.dna.sam" into LIB_SAM_DNA_EXT
-
-        script:
-        """
-        hisat2 -p ${task.cpus} -x ${index_pref} --no-spliced-alignment -k 100 \
-               --no-softclip -U ${input_dna} > ${library}.${chunk}.dna.sam
-        """
-    }
-}
-
-GENOME_SPLICESITES.into{GENOME_SPLICESITES_RNA1; GENOME_SPLICESITES_RNA2}
-
-/* Map RNA1 */
-LIB_SUBSTR_RNA1.combine(GENOME_INDEX_FOR_RNA1).combine(GENOME_SPLICESITES_RNA1)
-    .set{LIB_FOR_RNA1_MAPPING}
-
-process MAP_RNA1_CHUNKS{
-    tag "library:${library} chunk:${chunk}"
-
-    storeDir getOutputDir('sam')
-
-    input:
-    set val(library), val(chunk), file(input_rna1), val(index_pref), file(genome_index), file(known_splicesites) from LIB_FOR_RNA1_MAPPING
-
-    output:
-    set library, chunk, "${library}.${chunk}.rna1.sam" into LIB_SAM_RNA1
-
-    script:
-    """
-    hisat2 -p ${task.cpus} -x ${index_pref} -k 100 --no-softclip --known-splicesite-infile ${known_splicesites} \
-        --dta-cufflinks --novel-splicesite-outfile ${library}.${chunk}.novel.splicesites.txt \
-        -U ${input_rna1} > ${library}.${chunk}.rna1.sam
-    """
-}
-
-/* Map RNA2 */
-LIB_SUBSTR_RNA2.combine(GENOME_INDEX_FOR_RNA2).combine(GENOME_SPLICESITES_RNA2)
-    .set{LIB_FOR_RNA2_MAPPING}
-
-process MAP_RNA2_CHUNKS{
-    tag "library:${library} chunk:${chunk}"
-
-    storeDir getOutputDir('sam')
-
-    input:
-    set val(library), val(chunk), file(input_rna2), val(index_pref), file(genome_index), file(known_splicesites) from LIB_FOR_RNA2_MAPPING
-
-    output:
-    set library, chunk, "${library}.${chunk}.rna2.sam" into LIB_SAM_RNA2
-
-    script:
-    """
-    hisat2 -p ${task.cpus} -x ${index_pref} -k 100 --no-softclip --known-splicesite-infile ${known_splicesites} \
-        --dta-cufflinks --novel-splicesite-outfile ${library}.${chunk}.novel.splicesites.txt \
-        -U ${input_rna2} > ${library}.${chunk}.rna2.sam
-    """
-}
-
-
-////////////////////////////////
-/*       PARSE SAM TO BED     */
-////////////////////////////////
-/*
-Parse SAM files to BED files
-*/
-
-LIB_SAM_RNA1.into{LIB_SAM_RNA1_FOR_BED; LIB_SAM_RNA1_FOR_COLLECT}
-LIB_SAM_RNA2.into{LIB_SAM_RNA2_FOR_BED; LIB_SAM_RNA2_FOR_COLLECT}
-
-if (dna_extension.size()>0){
-    LIB_SAM_DNA.into{LIB_SAM_DNA_FOR_BED; LIB_SAM_DNA_FOR_COLLECT}
-    LIB_SAM_DNA_EXT.into{LIB_SAM_DNA_EXT_FOR_BED; LIB_SAM_DNA_EXT_FOR_COLLECT}
-    LIB_SAM_DNA_FOR_BED.map{ [it[0], it[1], "dna_nonextended", file(it[2]) ] }
-        .concat(LIB_SAM_DNA_EXT_FOR_BED.map{ [it[0], it[1], "dna", file(it[2]) ] })
-        .concat(LIB_SAM_RNA1_FOR_BED.map{ [it[0], it[1], "rna1", file(it[2]) ] })
-        .concat(LIB_SAM_RNA2_FOR_BED.map{ [it[0], it[1], "rna2", file(it[2]) ] }).set{LIB_SAM2BED}
-} else {
-    LIB_SAM_DNA.set{LIB_SAM_DNA_EXT_FOR_COLLECT}
-    LIB_SAM_DNA_FOR_BED.map{ [it[0], it[1], "dna_nonextended", file(it[2]) ] }
-        .concat(LIB_SAM_RNA1_FOR_BED.map{ [it[0], it[1], "rna1", file(it[2]) ] })
-        .concat(LIB_SAM_RNA2_FOR_BED.map{ [it[0], it[1], "rna2", file(it[2]) ] }).set{LIB_SAM2BED}
-}
-
-process SAM2BED_CHUNKS{
-    tag "library:${library} chunk:${chunk} ${segment_name}"
-
-    storeDir getOutputDir('bed')
-
-    input:
-    set val(library), val(chunk), val(segment_name), file(sam) from LIB_SAM2BED
-
-    output:
-    set library, chunk, segment_name, "${library}.${chunk}.${segment_name}.bed" into LIB_BED
-
-    script:
-    // 2 mismatches, up to 1 alignment
-    """
-    samtools view -Sh -F 4 ${sam} | grep -E 'XM:i:[0-2]\\s.*NH:i:1\$|^@' | samtools view -Sbh - \
-        | bedtools bamtobed -cigar -i stdin > ${library}.${chunk}.${segment_name}.bed
-    """
-}
-
-LIB_BED.into{LIB_BED_FOR_RESTR; LIB_BED_FOR_COLLECT}
-
-////////////////////////////////
-/*     CHECK RESTRICTION      */
-////////////////////////////////
-/*
-Check presence of restriction enzyme recognition sites at the ends of RNA parts.
-*/
-
-if (!check_restriction) {
-    Channel.create().into{LIB_DISTANCES; LIB_RESTR_COMBINATIONS}
-} else {
-    available_renz = params.protocol.renz
-
-    // Channel structure: key of the renz, segment (rna1, rna2 or dna) and strand of the renz (+ or -)
-    Channel.fromList(
-        params.run.restriction_check.collect{ segment, renz_keys ->
-            renz_keys.collect{ renz_key ->
-                available_renz.containsKey(renz_key) ?
-                    [renz_key, segment, ''] :
-                    renz_key.endsWith('p') ?
-                        [renz_key[0..-2], segment, '+'] :
-                        [renz_key[0..-2], segment, '-']
+    // Create multichannel by combining table with collection of columns:
+    TableFragmentsColumnsInput = Table.combine( Channel.from(FragmentCollection) )
+                                .multiMap { meta, id, col ->
+                                    table: [meta, id]
+                                    filters: col
+                                }
+
+    // Evaluate new columns for fragments:
+    TableFragmentsColumns = TABLE_EVALUATE_FRAGMENTS( TableFragmentsColumnsInput ).table
+
+    /* Collect fragments data: */
+    def FragmentData = params.fragments.collect {
+            fragment, fragment_params -> [fragment: fragment, params:fragment_params]
             }
-        }.sum()
-    ).into{LIST_FOR_RESTR_RUN; LIB_RESTR_COMBINATIONS}
+    FragmentsSelected = Table.combine( TableFragmentsColumns, by:0 ).combine( Channel.fromList(FragmentData) )
+                        // We now have a combined channel with structure: meta, table1, table2, fragment.
+                        // Re-structure this channel to [meta, files] and store fragment data in meta:
+                            .map { meta, table1, table2, fragment -> update_meta(
+                                    [meta, [table1, table2]],
+                                        [fragment: fragment.fragment,
+                                        side: fragment.params.side,
+                                        single_end: true,
+                                        selection_criteria: fragment.params.selection_criteria,
+                                        ext_suffix: fragment.params.getOrDefault('extension_suffix', ''),
+                                        ext_prefix: fragment.params.getOrDefault('extension_prefix', ''),
+                                        mapping_args: fragment.params.mapping_args,
+                                        restriction: fragment.params.getOrDefault('annotate_restriction', [['', '']])]
+                                    ) }
+                        // Tag it with the frag name (allows to recognize separate instances and have unique file names):
+                            .map { add_tag(it, it[0].fragment) }
 
-    LIST_FOR_RESTR_RUN
-        .combine(GENOME_RENZ, by:0)
-        .combine(LIB_BED_FOR_RESTR)
-        .filter{
-            renz_key, segment_left, renz_strand, renz_file, library, chunk, segment_right, bed_file ->
-            segment_left == segment_right
-         }.map{
-            renz_key, segment_left, renz_strand, renz_file, library, chunk, segment_right, bed_file ->
-            [library, chunk, segment_left, file(bed_file), renz_key, renz_strand, file(renz_file)]
-         }.set{ LIB_FOR_RESTR_RUN }
+    /* Extract FASTQs with fragments */
+    FragmentsFastqPreExtend = FRAGMENTS_TO_FASTQ( FragmentsSelected ).fastq // Convert to fastq
+                        // Split channels that will be extended with nucleotide suffix and prefix:
+                            .branch { it ->
+                                noExtend : (!(it[0].ext_suffix || it[0].ext_prefix))
+                                    return update_meta( it, [extended:false] )
+                                forExtend : (it[0].ext_suffix || it[0].ext_prefix)
+                                    return update_meta( it, [extended:true] )
+                                }
+    // Extend the fragments for which extension was requested:
+    FragmentsFastqExtended = FASTQ_EXTEND( FragmentsFastqPreExtend.forExtend ).fastq
+    // Mix channels with and without extension into a single channel:
+    FragmentsFastq = FragmentsFastqPreExtend.noExtend.mix(FragmentsFastqExtended)
 
-    process ANNOTATE_RENZYMES_CHUNKS{
-        tag "library:${library} ${chunk} ${segment_name} ${renz_key}${renz_strand}"
+    /* Map the fragments */
+    // Combine fragments with splicesites and index to make the operation deterministic (enables -resume)
+    Hisat2Input = FragmentsFastq.combine(SpliceSites).combine(Hisat2Index)
+                    // Channel structure: meta, fastq, splice_sites, ...index_files...
+                        .multiMap{it ->
+                             FragmentsFastq: [it[0], it[1]]
+                             Hisat2Index: it[3..-1]
+                             SpliceSites: it[2]
+                        }
+    // Align with hisat2:
+    Bam = HISAT2_ALIGN ( Hisat2Input ).bam
 
-        storeDir getOutputDir('table')
+    /* Convert to BED */
+    Bed = BAM2BED( Bam ).bed
 
-        input:
-        set library, chunk, segment_name, file(bed_file), renz_key, renz_strand, file(renz_file) from LIB_FOR_RESTR_RUN
+    /* Convert BED to table */
+    // Bed file might have some reads missing or unordered.
+    // Convert BED to table where the read order is guaranteed:
+    TableBedInput = Bed.combine(Table)
+                    // Combine input bed with input table by tagless ids:
+                        .filter{ it -> tagless(it[0].id) == it[2].id }
+                    // Channel structure: meta_bed, bed, meta_ref, ref
+                        .multiMap{ it ->
+                            bed: [it[0], it[1]]
+                            table_ref: [it[2], it[3]]
+                        }
+    // Note that you can get an error "No columns to parse" if the reads were not mapped at all:
+    TableBedFragments = TABLE_BED( TableBedInput ).table
 
-        output:
-        set library, chunk, segment_name, renz_key, renz_strand,
-            "${library}.${chunk}.${segment_name}.${renz_key}${renz_strand}.distances.txt" into LIB_DISTANCES
+    TableBedMergeInput = TableBedFragments
+                    // Remove rfrag tag from id and restructure the channel:
+                        .map{ meta, table -> remove_tag([meta, [table, meta.fragment]]) }
+                    // Remove any extra parameters of meta:
+                        .map{ removeKeys(it, extraKeys) }
+                    // groupTuple with sorting to guarantee deterministic output,
+                    // note that size depends on the number of fragments:
+                        .groupTuple(by:0, sort:{it->it[1]})
+                        .map{meta, it -> [meta, it.transpose().collect()]}
+                    // Create multi-channel:
+                        .multiMap{ meta, it ->
+                            table_bed: [meta, it[0]]
+                            suffixes: it[1]
+                        }
 
-        script:
-        def renz_strand_key = (renz_strand=="+") ? "p" : (renz_strand=="-") ? "n" : ""
-        def renz_strand_sub = (renz_strand=="+") ? "+" : (renz_strand=="-") ? "-" : "+"
-        def columns = [
-            "${segment_name}_start_${renz_key}${renz_strand_key}_left",
-            "${segment_name}_start_${renz_key}${renz_strand_key}_right",
-            "${segment_name}_end_${renz_key}${renz_strand_key}_left",
-            "${segment_name}_end_${renz_key}${renz_strand_key}_right"
-            ]
-        def header = (["id"]+columns).join(" ")
-        """
-        echo "${header}" > ${library}.${chunk}.${segment_name}.${renz_key}${renz_strand}.distances.txt
-        get_closest_sites.py ${bed_file} ${renz_file} ${renz_strand_sub} ${library}.${chunk}.${segment_name}.${renz_key}${renz_strand}.distances.txt
-        """
-    }
-}
+    TableBed = TABLE_FRAGMENTS_MERGE( TableBedMergeInput ).table
 
-///////////////////////////////////////////
-/*      COLLECT DATASETS AND FILTERS     */
-///////////////////////////////////////////
-/*
-Collect all outputs into two hdf5 files: collected data and filters
-*/
 
-LIB_MAPPED_OLIGOS_FOR_COLLECT.branch{
-            bridge_forward: it[2]=="bridge_forward" & it[3]==1
-            ggg: it[2]=="ggg" & it[3]==2
-        }.set{LIB_MAPPED_OLIGOS_FOR_COLLECT_BRANCHED}
+    /* Annotate restriction */
+    // Restriction annotation takes BED file, reads table and renzyme file as input
+    // and for each fragment reports the closest restriction recognition sites (on the left and on the right).
+    // First, create formatted input for the TABLE_ANNOTATE_RESTRICTION process:
+    TableBedExpanded = TableBedFragments
+                    // Filter out non-restricted fragments:
+                        .filter{ it[0].getOrDefault('restriction', '') }
+                    // Emit for each restriction enzyme and orientation:
+                        .map{it -> [it[0], it[1], it[0].restriction] }.transpose(by:2)
+                    // Update meta params:
+                        .map{ meta, file, restriction -> update_meta( [meta, file], [restriction: restriction] ) }
+                    // Update id to include restriction enzyme:
+                        .map { add_tag(it, it[0].restriction.join()) }
 
-dna_mode = (dna_extension.size()>0) ? "dna" : "dna_nonextended"
-LIB_BED_FOR_COLLECT.branch{
-        dna : it[2]==dna_mode
-        rna1 : it[2]=="rna1"
-        rna2 : it[2]=="rna2"
-    }.set{LIB_BED_FOR_COLLECT_BRANCHED}
+    TableRestrictionInput = TableBedExpanded.combine( RestrictedChannel )
+                    // Channel: meta_bed, bed, meta_restr, restr
+                    // Take renzyme annotation for the same renzyme and strand orientation:
+                        .filter{ it -> it[0].restriction == [it[2].renzyme, it[2].renz_strand] }
+                    // Multi-channel:
+                        .multiMap{ it ->
+                            bed: [it[0], it[1]]
+                            restr: [it[2], it[3]]
+                        }
+    // Annotate bed files by the sites of restriction recognition:
+    TableRestrictionFragments = TABLE_ANNOTATE_RESTRICTION( TableRestrictionInput ).table
 
-LIB_DISTANCES
-    .groupTuple(by: [0,1]).map{it -> [it[0], it[1], it[5]]}.set{ LIB_DISTANCES_FOR_COLLECT }
+    // Merge restriction tables into a single one:
+    TableRestrictionMergeInput = TableRestrictionFragments
+                    // Remove restriction tag:
+                        .map{ remove_tag(it, 2) }
+                    // Remove any extra parameters of meta:
+                        .map{ removeKeys(it, extraKeys ) }
+                    // Group by meta. Note that size depends on the number of fragments:
+                        .groupTuple(by:0, sort:true)
+                    // Combine with empty suffixes(required input for TABLE_RESTRICTION_MERGE).
+                    // We don't have to add specific suffixes here, because fragments/renzymes
+                    // are stored in the columns of individual tables:
+                        .combine(Channel.from(''))
+                    // Multi-channel:
+                        .multiMap{ meta, files, suffixes ->
+                            table_bed: [meta, files]
+                            suffixes: suffixes
+                        }
 
-IDS_FASTUNIQ
-    .combine(LIB_TABLE_FASTQ_FOR_COLLECT, by:0).map{ v -> [v[0], v[2], v[3], v[1]]}
-    .combine(LIB_TRIMTABLE_FOR_COLLECT, by: [0,1])
-    .combine(LIB_MAPPED_OLIGOS_FOR_COLLECT_BRANCHED.bridge_forward.map{it -> [it[0], it[1], it[4]]}, by: [0,1])
-    .combine(LIB_MAPPED_GA, by: [0,1])
-    .combine(LIB_MAPPED_OLIGOS_FOR_COLLECT_BRANCHED.ggg.map{it -> [it[0], it[1], it[4]]}, by: [0,1])
-    .combine(LIB_SUBSTR_DNA_INFO, by:[0,1])
-    .combine(LIB_SUBSTR_RNA1_INFO, by:[0,1])
-    .combine(LIB_SUBSTR_RNA2_INFO, by:[0,1])
-    .combine(LIB_SAM_DNA_EXT_FOR_COLLECT, by:[0,1])
-    .combine(LIB_SAM_DNA_FOR_COLLECT, by:[0,1])
-    .combine(LIB_SAM_RNA1_FOR_COLLECT, by:[0,1])
-    .combine(LIB_SAM_RNA2_FOR_COLLECT, by:[0,1])
-    .combine(LIB_BED_FOR_COLLECT_BRANCHED.dna.map{it -> [it[0], it[1], it[3]]}, by:[0,1])
-    .combine(LIB_BED_FOR_COLLECT_BRANCHED.rna1.map{it -> [it[0], it[1], it[3]]}, by:[0,1])
-    .combine(LIB_BED_FOR_COLLECT_BRANCHED.rna2.map{it -> [it[0], it[1], it[3]]}, by:[0,1])
-    .combine(LIB_DISTANCES_FOR_COLLECT, by:[0,1])
-    .map{ v -> [ v[0], v[1], v[2..-2]+v[-1] ] }.set{ LIB_COLLECT }
+    TableRestriction = TABLE_RESTRICTION_MERGE( TableRestrictionMergeInput ).table
 
-process COLLECT_DATA_CHUNKS{
-        tag "library:${library} ${chunk}"
+    /* Evaluation of final filters */
+    /* Collect final tables */
+    TablesCollected = Table.mix(TableBed)
+                        .mix(TableRestriction)
+                        .mix(TableDedup)
+                        .mix(TableFragmentsColumns)
+                    // Remove any extra parameters of meta:
+                        .map{ removeKeys(it, extraKeys) }
+                    // All channels have the same keys in meta, we can group by it.
+                    // Channel: meta, [table, table_bed, table_dedup, table_fragments]
+                    // (tables might be in some other order, sorting depends on full file names)
+                        .groupTuple(by:0, sort:true)
 
-        storeDir getOutputDir('hdf5')
-
-        input:
-        set val(library), val(chunk), file(input) from LIB_COLLECT
-
-        output:
-        set library, chunk, "${library}.${chunk}.data.hdf5" into LIB_COLLECTED
-
-        script:
-        """
-        collect_data.py ${library}.${chunk}.data.hdf5 ${input}
-        """
-}
-
-def restriction_patterns = params.filters.restriction
-                   .collect{k, v -> k+":"+"("+v.join(") | (")+")"}.join("\\n")
-                   .replaceAll(/"\+"/, "1")
-                   .replaceAll(/"-"/, "0")
-def additional_patterns = params.filters.additional_filters
-                   .collect{k, v -> k+":"+v}.join("\\n")
-patterns = [restriction_patterns, additional_patterns].join("\\n")
-
-if (params.output.make_cooler) {
-    GENOME_CHROMSIZES.into{GENOME_CHROMSIZES_FOR_FILTERS; GENOME_CHROMSIZES_FOR_COOLER}
-    }
-else {
-    GENOME_CHROMSIZES.set{GENOME_CHROMSIZES_FOR_FILTERS}
-}
-
-LIB_COLLECTED.combine(GENOME_CHROMSIZES_FOR_FILTERS).set{LIB_COLLECTED_FOR_FILTERS}
-
-process COLLECT_FILTERS_CHUNKS{
-        tag "library:${library} ${chunk}"
-
-        storeDir getOutputDir('hdf5')
-
-        input:
-        set val(library), val(chunk), file(input), file(genome_chromsizes), val(assembly) from LIB_COLLECTED_FOR_FILTERS
-
-        output:
-        set library, chunk, "${library}.${chunk}.data.hdf5", "${library}.${chunk}.filters.hdf5" into LIB_FILTERS
-
-        script:
-        def chrom_pattern = params.filters.canonical_chromosomes
-
-        """
-        printf '${patterns}' > filters.txt
-        filter_data.py ${input} ${library}.${chunk}.filters.hdf5 \
-            ${genome_chromsizes} "${chrom_pattern}" filters.txt
-        """
-}
-
-LIB_FILTERS.into{ LIB_FILTERS_STATS; LIB_FILTERS_TABLE }
-
-//////////////////////////////////
-/*         WRITE STATS          */
-//////////////////////////////////
-/*
-Write params.report_stats from filters.hdf5 into text file.
-Then we merge stats on chunks into a single file.
-*/
-
-def stats_list = params.report_stats.collect()
-
-process WRITE_STATS_CHUNKS{
-        tag "library:${library} chunk:${chunk}"
-
-        storeDir getOutputDir('stats')
-
-        input:
-        set val(library), val(chunk), file(data_hdf5), file(filters_hdf5) from LIB_FILTERS_STATS
-
-        output:
-        set library, chunk, "${library}.${chunk}.stats.txt" into FILES_STATS
-
-        script:
-        def stats_str = '["'+ stats_list.join('", "')+'"]'
-        """
-        #!/usr/bin/env python
-
-import h5py
-f = h5py.File("${filters_hdf5}", 'r')
-with open("${library}.${chunk}.stats.txt", "w") as outfile:
-    for filt in ${stats_str}:
-        n = int(sum(f[filt][()]))
-        outfile.write(f"{filt}\\t{n}\\n")
-f.close()
-        """
-}
-
-FILES_STATS.groupTuple(by:0).set{FILES_STATS_FOR_MERGE}
-
-process MERGE_STATS{
-        tag "library:${library}"
-
-        storeDir getOutputDir('stats')
-
-        input:
-        set val(library), val(chunk), file(files_stats) from FILES_STATS_FOR_MERGE
-
-        output:
-        set library, "${library}.stats.txt" into FILES_STATS_MERGED
-
-        script:
-        def files_str = '["'+ files_stats.join('", "')+'"]'
-        """
-        #!/usr/bin/env python
-
-import pandas as pd
-res = []
-for f in ${files_str}:
-    tmp = pd.read_csv(f, sep='\\t', header=None).set_index(0)
-    if len(res)==0:
-        res = tmp.copy()
-    else:
-        res += tmp
-res.to_csv("${library}.stats.txt", sep='\t', header=False, index=True)
-        """
-}
-
-//////////////////////////////////
-/*       WRITE FINAL TABLES     */
-//////////////////////////////////
-/*
-Write final tables from filters.hdf5 and data.hdf5 into text file.
-Then we merge chunks into a single file.
-You can request one or several files with different information in params.output.
-*/
-
-if (params.output.make_final_table){
-    Channel.fromList(
-        tables_list = params.output.tables.collect{ k, v -> [k, v['filter'], v['header']]}
-        ).set{LIST_TABLES}
-
-    LIB_FILTERS_TABLE.combine(LIST_TABLES).set{LIB_FOR_WRITING}
-
-    process WRITE_FINAL_TABLE_CHUNKS{
-            tag "library:${library} chunk:${chunk} table:${table_name}"
-
-            storeDir getOutputDir('final_table')
-
-            input:
-            set val(library), val(chunk), file(data_hdf5), file(filters_hdf5),
-                val(table_name), val(filter), val(header) from LIB_FOR_WRITING
-
-            output:
-            set library, chunk, table_name, "${library}.${chunk}.${table_name}.tsv" into FILES_TABLE
-
-            script:
-            def stats_str = '["'+ stats_list.join('", "')+'"]'
-            """
-            #!/usr/bin/env python
-
-    import numpy as np
-
-    import h5py
-    f_filt = h5py.File("${filters_hdf5}", 'r')
-    f_data = h5py.File("${data_hdf5}", 'r')
-
-    header = "${header}".split()
-    res = {}
-    for col in header+["${filter}"]:
-        try:
-            res[col] = f_filt[col][()]
-        except Exception as e:
-            res[col] = f_data[col][()]
-    f_filt.close()
-    f_data.close()
-
-    def strand(x):
-        if x:
-            return "+"
-        return "-"
-
-    indexes = np.where(res["${filter}"])[0]
-    with open("${library}.${chunk}.${table_name}.tsv", "w") as outfile:
-        outfile.write( "\\t".join(header)+"\\n" )
-        for i in indexes:
-            line = [res[col][i] if isinstance(res[col][i], str) else
-                    strand(res[col][i]) if 'strand' in col else
-                    res[col][i].decode() if isinstance(res[col][i], np.bytes_) else
-                    str(res[col][i]) for col in header]
-            line = "\\t".join( line )+"\\n"
-            outfile.write( line )
-
-            """
+    /*  Collect final filters: */
+    def FilterColumns = [:]
+    for (filter_name in params.filters.keySet()){
+        def filter_params = params.filters[filter_name]
+        if (filter_params instanceof List) {
+            filter_params = "(" + filter_params.join(") | (") + ")"
+        }
+        FilterColumns[filter_name] = filter_params
     }
 
-    FILES_TABLE.groupTuple(by:[0,2]).set{FILES_TABLE_FOR_MERGE}
+    /* Evaluate filters on collected tables: */
+    TableEvaluateInput = TablesCollected.combine(Channel.from(FilterColumns))
+                          .multiMap{ it ->
+                                tables: [it[0], it[1]]
+                                filters: it[2]
+                          }
+    TableFinalChunked = TABLE_EVALUATE_FILTERS( TableEvaluateInput ).table
 
-    process MERGE_TABLE{
-            tag "library:${library} table:${table_name}"
+    /* Output tables */
+    TableAllChunked = TablesCollected.combine(TableFinalChunked, by:0)
+                        .map{it -> [it[0], it[1]+[it[2]]]}
 
-            storeDir getOutputDir('final_table')
+    if (params.output['tables']){
 
-            input:
-            set val(library), val(chunk), val(table_name), file(files_stats) from FILES_TABLE_FOR_MERGE
+        // Channel: [table_name, filter, [header_columns]]
+        FilesCollection = Channel.fromList(
+                params.output.tables.collect{ k, v -> [k, v['filter'], v['header'].split(" ")]}
+            )
 
-            output:
-            set library, table_name, "${library}.${table_name}.tsv" into FILES_TABLE_MERGED
-
-            script:
-            """
-            head -n 1 "${files_stats[0]}" > ${library}.${table_name}.tsv
-            for FILE in ${files_stats}
-            do
-                tail -n +2 \$FILE >> ${library}.${table_name}.tsv
-            done
-            """
+        DumpInput = TableAllChunked.combine(FilesCollection)
+                    // Channel: [meta, files, table_name, filter, [header_columns]]
+                    // Add tag with table name:
+                        .map{ add_tag(it, it[2]) }
+                    // Add meta keys. Table_name is for identification of table type.
+                    // Columns will guarantee the order in STACK:
+                        .map{ update_meta(it, [table_name: it[2], columns:it[4]]) }
+                    // Multi-channel:
+                        .multiMap{ it ->
+                            table: [it[0], it[1]]
+                            filter: it[3]
+                            columns: it[4]
+                        }
+        TableDumpedChunked = TABLE_DUMP( DumpInput ).table
+        TableChunked = TableDumpedChunked.mix( TableFinalChunked.map{ update_meta(it, [table_name:'filters']) } )
     }
+    else {
+        TableChunked = TableFinalChunked.map{ update_meta(it, [table_name:'filters']) }
+    }
+
+    /* Merge final tables between replicates: */
+    TableStackChunksInput = TableChunked.map{ it -> [[sample:it[0].original_id, table_name:it[0].table_name], [it[0], it[1]]] }
+                 // Group chunks and sort by chunk number:
+                     .groupTuple(by:0, sort:{it -> it[0].chunk})
+                 // Channel: [meta, [..tables..]] (tables were sorted by chunk and table type)
+                     .map{id, it -> [it[0][0], it.transpose().collect()[1]]}
+                 // Replace id with original_id and remove chunk from meta:
+                    .map{ update_meta(it, [id: it[0].original_id]) }
+                    .map{ removeKeys(it, ['chunk']) }
+
+    if (params.protocol.getOrDefault('merge_groups', false)) {
+        TableStackGroupInput = TableChunked.map{ it -> [[sample:it[0].group, table_name:it[0].table_name], [it[0], it[1]]] }
+                 // Group chunks and sort by chunk number:
+                     .groupTuple(by:0, sort:{it -> it[0].original_id})
+                 // Channel: [meta, [..tables..]] (tables were sorted by original_id)
+                     .map{id, it -> [it[0][0], it.transpose().collect()[1]]}
+                 // Replace id with original_id and remove chunk from meta:
+                    .map{ update_meta(it, [id: it[0].group+'.merged.'+it[0].table_name]) }
+                    .map{ removeKeys(it, ['chunk', 'original_id']) }
+        TableStackInput = TableStackChunksInput.mix(TableStackGroupInput)
+    } else {
+        TableStackInput = TableStackChunksInput
+    }
+
+    TableFinal = RESULTS_STACK( TableStackInput ).table
+
+    if (params.output['stats']){
+        /* Write table with stats */
+
+        // Channel: [stats_name, [header_columns]]
+        StatsList = Channel.fromList(
+                params.output.stats.collect{ k, v -> [k, v] }
+        )
+
+        StatsInput = TableFinal.combine(StatsList)
+                    // Channel: [meta, file, stats_name, [cols]]
+                    // Filter appropriate tables:
+                        .filter{ it[0].table_name==it[3].table_name }
+                    // Add tag with stats name:
+                        .map{ add_tag(it, it[2]) }
+                    // Update meta with the name of stats:
+                        .map{ update_meta(it, [stats_name:it[2]]) }
+                    // Multi-channel:
+                        .multiMap{ it ->
+                            table: [it[0], it[1]]
+                            columns: it[3].filters
+                        }
+        TableStats = RESULTS_STATS( StatsInput ).table
+
+    }
+
+    if (params.output['tables'] && params.output['cooler']){
+        /* Write coolers */
+
+        // Channel: [cool_name, params]
+        CoolerList = Channel.fromList(
+                params.output.cooler.collect{ k, v -> [k, v] }
+        )
+
+        CoolerInput = TableFinal.combine(CoolerList)
+                    // Channel: [meta, file, cool_name, params]
+                    // Select only requested dumped table:
+                        .filter{ it[0].table_name == it[3].table_name }
+                    // Add tag with stats name:
+                        .map{ add_tag(it, it[2]) }
+                    // Update meta with parameters:
+                        .map{ update_meta(it, it[3]) }
+                        .map{ update_meta(it, params) }
+                    // Combine with chromosome sizes:
+                        .combine(ChromSizes)
+                    // Channel: [meta, file, cool_name, params, chromsizes]
+                    // Multi-channel:
+                        .multiMap{ it ->
+                            table: [it[0], it[1]]
+                            chromsizes: it[4]
+                        }
+        Coolers = COOLER_MAKE( CoolerInput )
+
+    }
+
 }
 
-if (params.output.make_cooler) {
+workflow {
 
-    /* Create output channel for writing cooler: */
-    FILES_TABLE_MERGED.filter{ it[1] == params.output.cooler_properties.table_name }
-      .combine(GENOME_CHROMSIZES_FOR_COOLER)
-      .set{ TABLES_FOR_COOLER }
+    REDC ( )
 
-    process WRITE_COOLER{
-            tag "library:${library}"
+}
+workflow.onComplete {
+    log.info "Done!"
+}
 
-            storeDir getOutputDir('cooler')
-
-            input:
-            set val(library),
-                val(table_name),
-                file(table),
-                file(chromsizes),
-                val(assembly) from TABLES_FOR_COOLER
-
-            output:
-            set library,
-                "${assembly}.${resolution}.bins.txt",
-                "${library}.${params.output.cooler_properties.resolution}.cool" into COOLERS
-
-            script:
-            resolution = params.output.cooler_properties.resolution
-            """
-            cooler makebins ${chromsizes} 1000 > ${assembly}.${resolution}.bins.txt
-            cooler cload pairs --no-symmetric-upper \
-              -c1 ${params.output.cooler_properties.c1} -c2 ${params.output.cooler_properties.c2} \
-              -p1 ${params.output.cooler_properties.p1} -p2 ${params.output.cooler_properties.p2} \
-              ${assembly}.${resolution}.bins.txt <(tail -n +2 $table) "${library}.${resolution}.cool"
-
-            """
+def update_meta( it, hashMap ) {
+/* Update the meta hashMap. Takes channel of structure [meta, ..data..]. */
+    def meta = [:]
+    def keys = it[0].keySet() as String[]
+    for( def key in keys ) {
+        meta[key] = it[0][key]
     }
+
+    def keys_new = hashMap.keySet() as String[]
+    for( def key in keys_new ) {
+        meta[key] = hashMap[key]
+    }
+
+    def array = [ meta, *it[1..-1] ]
+    return array
+}
+
+def add_tag( it, tag, id_key='id' ) {
+/* Add the tag to id (after dot). Takes channel of structure [meta, ..data..].  */
+    def meta = [:]
+    def keys = it[0].keySet() as String[]
+    for( def key in keys ) {
+        meta[key] = it[0][key]
+    }
+    meta[id_key] = meta[id_key]+'.'+tag
+    def array = [ meta, *it[1..-1] ]
+    return array
+}
+
+def tagless( s, n=1 ) {
+/* Remove n tags from string s  */
+    def res = s
+    for( def i in 1..n ) {
+        res = res.take(res.lastIndexOf('.'))
+    }
+    return res
+}
+
+def remove_tag( it, n=1, id_key='id' ) {
+/* Remove n tags from id (after dot). Takes channel of structure [meta, ..data..]. */
+    def meta = [:]
+    def keys = it[0].keySet() as String[]
+    for( def key in keys ) {
+        meta[key] = it[0][key]
+    }
+    for( def i in 1..n ) {
+        meta[id_key] = meta[id_key].take(meta[id_key].lastIndexOf('.')) // same as: meta[id_key] = tagless(meta[id_key], n)
+    }
+    def array = [ meta, *it[1..-1] ]
+    return array
+}
+
+def removeKeys( it, ks ) {
+/* Remove keys from hashMap. Take channel of structure [meta, ..data..].  */
+    def meta = [:]
+    def keys = it[0].keySet() as String[]
+    for( def key in keys ) {
+        if (!(key in ks)) {
+            meta[key] = it[0][key]
+        }
+    }
+
+    def array = [ meta, *it[1..-1] ]
+    return array
 }
