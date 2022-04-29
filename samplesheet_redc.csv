@@ -1,0 +1,2 @@
+sample,group,fastq_1,fastq_2,rlen,single_end
+Ecoli,Ecoli,/home/evkogs/project/data/AG83_S2_R1_002.fastq.gz,/home/evkogs/project/data/AG83_S2_R2_002.fastq.gz,101,false
