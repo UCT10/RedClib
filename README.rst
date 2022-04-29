@@ -29,7 +29,7 @@ System requirements and test run
    which will contain redc-nf dependencies: ::
 
 
-    conda env create -n redc-nf
+    conda env create -n redc-nf -f=environment.yml
     conda activate redc-nf
     conda install -c bioconda "nextflow>=21.10"
     bash ./bin/prepare_binaries.sh
@@ -42,7 +42,7 @@ It is safe to use nextflow >= 21.10 version. Check the version of your nextflow 
 
 2. Run test example: ::
 
-    nextflow run redc.nf -profile test,conda -params-file params-redc.yml
+    nextflow run redc.nf -params-file params-redc.yml
 
 This example should take up to 30 minutes (depends a lot on your conda performance, as there are around five 
 different environments constructed along the run).
